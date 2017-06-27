@@ -1,6 +1,7 @@
 import pytest
 
-from async_streams import Limits, Stream, IncompleteReadError
+from async_streams import (Limits, Stream, IncompleteReadError,
+                           LimitOverrunError)
 
 
 DATA = b'line1\nline2\nline3\n'
@@ -347,3 +348,96 @@ async def test_readuntil_eof(loop):
     assert cm.value.partial == b'some dataAA'
     assert cm.value.expected is None
     assert b'' == stream._buffer
+
+
+async def test_readuntil_limit_found_sep(loop):
+    limits = Limits(read_high=3, read_low=1, write_high=10, write_low=1)
+
+    stream = Stream(loop=loop, limits=limits)
+    stream._feed_data(b'some dataAA')
+
+    with pytest.raises(LimitOverrunError) as cm:
+        await stream.readuntil(b'AAA')
+    assert 'not found' in str(cm.value)
+
+    assert b'some dataAA' == stream._buffer
+
+    stream._feed_data(b'A')
+    with pytest.raises(LimitOverrunError) as cm:
+        await stream.readuntil(b'AAA')
+    assert 'not found' in str(cm.value)
+
+    assert b'some dataAAA' == stream._buffer
+
+
+async def test_readexactly_zero_or_less(loop):
+    # Read exact number of bytes (zero or less).
+    stream = Stream(loop=loop)
+    stream._feed_data(DATA)
+
+    data = await stream.readexactly(0)
+    assert b'' == data
+    assert DATA == stream._buffer
+
+    with pytest.raises(ValueError) as cm:
+        await stream.readexactly(-1)
+    assert 'less than zero' in str(cm.value)
+    assert DATA == stream._buffer
+
+
+async def test_readexactly(loop):
+    # Read exact number of bytes.
+    stream = Stream(loop=loop)
+
+    def cb():
+        stream._feed_data(DATA)
+        stream._feed_data(DATA)
+        stream._feed_data(DATA)
+    loop.call_soon(cb)
+
+    n = 2 * len(DATA)
+    data = await stream.readexactly(n)
+    assert DATA + DATA == data
+    assert DATA == stream._buffer
+
+
+async def test_readexactly_limit(loop):
+    limits = Limits(read_high=3, read_low=1, write_high=10, write_low=1)
+    stream = Stream(limits=limits, loop=loop)
+    stream._feed_data(b'chunk')
+    data = await stream.readexactly(5)
+    assert b'chunk' == data
+    assert b'' == stream._buffer
+
+
+async def test_readexactly_eof(loop):
+    # Read exact number of bytes (eof).
+    stream = Stream(loop=loop)
+
+    def cb():
+        stream.feed_data(DATA)
+        stream.feed_eof()
+    loop.call_soon(cb)
+
+    n = 2 * len(DATA)
+
+    with pytest.raises(IncompleteReadError) as cm:
+        await stream.readexactly(n)
+
+    assert cm.value.partial == DATA
+    assert cm.value.expected == n
+    assert str(cm.value) == '18 bytes read on a total of 36 expected bytes'
+    assert b'' == stream._buffer
+
+
+def test_readexactly_exception(loop):
+    stream = Stream(loop=loop)
+    stream.feed_data(b'line\n')
+
+    data = self.loop.run_until_complete(stream.readexactly(2))
+    self.assertEqual(b'li', data)
+
+    stream.set_exception(ValueError())
+    self.assertRaises(
+        ValueError, self.loop.run_until_complete, stream.readexactly(2))
+
