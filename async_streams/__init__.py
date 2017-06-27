@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import socket
 
@@ -13,11 +14,11 @@ Limits = namedtuple('Limits', 'read_high read_low write_high write_low')
 logger = logging.getLogger(__package__)
 
 
-_DEFAULT_LIMIT = Limits(2 ** 16, 2 ** 8, 2 ** 16, 2 ** 8)
+_DEFAULT_LIMITS = Limits(2 ** 16, 2 ** 14, 2 ** 16, 2 ** 14)
 
 
 async def open_connection(host=None, port=None, *,
-                          limits=_DEFAULT_LIMIT, **kwds):
+                          limits=_DEFAULT_LIMITS, **kwds):
     """A wrapper for create_connection() returning a (reader, writer) pair.
 
     The reader returned is a StreamReader instance; the writer is a
@@ -44,7 +45,7 @@ async def open_connection(host=None, port=None, *,
 
 
 async def start_server(client_connected_cb, host=None, port=None, *,
-                       limits=_DEFAULT_LIMIT, **kwds):
+                       limits=_DEFAULT_LIMITS, **kwds):
     """Start a socket server, call back for each client connected.
 
     The first parameter, `client_connected_cb`, takes two parameters:
@@ -82,7 +83,7 @@ if hasattr(socket, 'AF_UNIX'):
     # UNIX Domain Sockets are supported on this platform
 
     async def open_unix_connection(path=None, *,
-                                   limits=_DEFAULT_LIMIT, **kwds):
+                                   limits=_DEFAULT_LIMITS, **kwds):
         """Similar to `open_connection` but works with UNIX Domain Sockets."""
         loop = asyncio.get_event_loop()
         stream = Stream(limits=limits, loop=loop)
@@ -92,7 +93,7 @@ if hasattr(socket, 'AF_UNIX'):
         return stream
 
     async def start_unix_server(client_connected_cb, path=None, *,
-                                limits=_DEFAULT_LIMIT, **kwds):
+                                limits=_DEFAULT_LIMITS, **kwds):
         """Similar to `start_server` but works with UNIX Domain Sockets."""
         loop = asyncio.get_event_loop()
 
@@ -133,7 +134,7 @@ class LimitOverrunError(Exception):
 
 
 class Stream:
-    def __init__(self, limits, *, loop):
+    def __init__(self, *, limits=_DEFAULT_LIMITS, loop):
         self._limits = limits
         self._loop = loop
         self._close_waiter = loop.create_future()
@@ -142,8 +143,10 @@ class Stream:
         self._buffer = bytearray()
         self._eof = False    # Whether we're done.
         self._read_waiter = None  # A future used by _wait_for_data()
+        self._write_waiter = None  # A future used by _drain()
         self._exception = None
-        self._paused = False
+        self._read_paused = False
+        self._write_paused = False
 
     def __repr__(self):
         info = [self.__class__.__name__]
@@ -151,7 +154,7 @@ class Stream:
             info.append('%d bytes' % len(self._buffer))
         if self._eof:
             info.append('eof')
-        if self._limits != _DEFAULT_LIMIT:
+        if self._limits != _DEFAULT_LIMITS:
             info.append('l=%d' % self._limits)
         if self._read_waiter:
             info.append('w=%r' % self._read_waiter)
@@ -159,8 +162,10 @@ class Stream:
             info.append('e=%r' % self._exception)
         if self._transport:
             info.append('t=%r' % self._transport)
-        if self._paused:
-            info.append('paused')
+        if self._read_paused:
+            info.append('read_paused')
+        if self._write_paused:
+            info.append('write_paused')
         return '<%s>' % ' '.join(info)
 
     @property
@@ -171,83 +176,108 @@ class Stream:
         return self._transport.get_extra_info(name, default)
 
     async def write(self, data):
-        await self._drain_helper()
+        await self._drain()
         self._transport.write(data)
 
     async def writelines(self, data):
-        await self._drain_helper()
+        await self._drain()
         self._transport.writelines(data)
 
     async def write_eof(self):
-        await self._drain_helper()
+        await self._drain()
         return self._transport.write_eof()
 
     def can_write_eof(self):
         return self._transport.can_write_eof()
 
     async def close(self):
-        ret = self._transport.close()
-        await self._close_waiter()
-        return ret
+        self._transport.close()
+        await self._close_waiter
 
     def exception(self):
         return self._exception
 
-    def set_exception(self, exc):
+    def _set_exception(self, exc):
         self._exception = exc
 
-        waiter = self._waiter
+        waiter = self._read_waiter
         if waiter is not None:
-            self._waiter = None
+            self._read_waiter = None
             if not waiter.cancelled():
                 waiter.set_exception(exc)
 
-    def _wakeup_waiter(self):
-        """Wakeup read*() functions waiting for data or EOF."""
-        waiter = self._waiter
+        waiter = self._write_waiter
         if waiter is not None:
-            self._waiter = None
+            self._write_waiter = None
+            if not waiter.cancelled():
+                waiter.set_exception(exc)
+
+    def _wakeup_readers(self):
+        """Wakeup read*() functions waiting for data or EOF."""
+        waiter = self._read_waiter
+        if waiter is not None:
+            self._read_waiter = None
             if not waiter.cancelled():
                 waiter.set_result(None)
 
-    def set_transport(self, transport):
+    def _wakeup_writers(self):
+        """Wakeup write*() functions waiting for data or EOF."""
+        waiter = self._write_waiter
+        if waiter is not None:
+            self._write_waiter = None
+            if not waiter.cancelled():
+                if self._eof:
+                    waiter.set_exception(
+                        ConnectionResetError('Connection lost'))
+                else:
+                    waiter.set_result(None)
+
+    def _setup(self, transport, protocol):
+        # INTERNAL API
         assert self._transport is None, 'Transport already set'
         self._transport = transport
+        transport.set_write_buffer_limits(self._limits.write_high,
+                                          self._limits.write_low)
+        assert self._protocol is None, 'Protocol already set'
+        self._protocol = protocol
 
     def _maybe_resume_transport(self):
-        if self._paused and len(self._buffer) <= self._limit:
-            self._paused = False
+        if self._read_paused and len(self._buffer) <= self._limits.read_low:
+            self._read_paused = False
             self._transport.resume_reading()
 
-    def feed_eof(self):
+    def _feed_eof(self):
+        # INTERNAL API
         self._eof = True
-        self._wakeup_waiter()
+        self._wakeup_readers()
+        self._wakeup_writers()
+        # TODO: cancel writer
 
     def at_eof(self):
         """Return True if the buffer is empty and 'feed_eof' was called."""
         return self._eof and not self._buffer
 
-    def feed_data(self, data):
+    def _feed_data(self, data):
+        # INTERNAL API
         assert not self._eof, 'feed_data after feed_eof'
 
         if not data:
             return
 
         self._buffer.extend(data)
-        self._wakeup_waiter()
+        self._wakeup_readers()
 
         if (self._transport is not None and
-                not self._paused and
-                len(self._buffer) > 2 * self._limit):
+                not self._read_paused and
+                len(self._buffer) > self._limits.read_high):
             try:
                 self._transport.pause_reading()
             except NotImplementedError:
-                # The transport can't be paused.
-                # We'll just have to buffer all data.
-                # Forget the transport so we don't keep trying.
-                self._transport = None
+                self._set_exception(
+                    RuntimeError("Underlying transport "
+                                 "doesn't support .pause_reading()"))
             else:
-                self._paused = True
+                self._read_paused = True
 
     async def _wait_for_data(self, func_name):
         """Wait until feed_data() or feed_eof() is called.
@@ -259,15 +289,16 @@ class Stream:
         # would have an unexpected behaviour. It would not possible to know
         # which coroutine would get the next data.
         if self._read_waiter is not None:
-            raise RuntimeError('%s() called while another coroutine is '
-                               'already waiting for incoming data' % func_name)
+            raise RuntimeError("%s() called while another coroutine is "
+                               "already waiting for incoming data" % func_name)
 
-        assert not self._eof, '_wait_for_data after EOF'
+        if self._eof:
+            raise ValueError("I/O operation on closed stream.")
 
         # Waiting for data while paused will make deadlock, so prevent it.
         # This is essential for readexactly(n) for case when n > self._limit.
-        if self._paused:
-            self._paused = False
+        if self._read_paused:
+            self._read_paused = False
             self._transport.resume_reading()
 
         self._read_waiter = self._loop.create_future()
@@ -372,7 +403,7 @@ class Stream:
 
                 # see upper comment for explanation.
                 offset = buflen + 1 - seplen
-                if offset > self._limit:
+                if offset > self._limits.read_high:
                     raise LimitOverrunError(
                         'Separator is not found, and chunk exceed the limit',
                         offset)
@@ -389,7 +420,7 @@ class Stream:
             # _wait_for_data() will resume reading if stream was paused.
             await self._wait_for_data('readuntil')
 
-        if isep > self._limit:
+        if isep > self._limits.read_high:
             raise LimitOverrunError(
                 'Separator is found, but chunk is longer than limit', isep)
 
@@ -432,7 +463,7 @@ class Stream:
             # bytes.  So just call self.read(self._limit) until EOF.
             blocks = []
             while True:
-                block = await self.read(self._limit)
+                block = await self.read(self._limits.read_high)
                 if not block:
                     break
                 blocks.append(block)
@@ -505,19 +536,33 @@ class Stream:
         await self.close()
 
     async def _drain(self):
-        exc = self._reader.exception()
+        exc = self._exception
         if exc is not None:
             raise exc
-        if self._transport is not None:
-            if self._transport.is_closing():
-                # Yield to the event loop so connection_lost() may be
-                # called.  Without this, _drain_helper() would return
-                # immediately, and code that calls
-                #     write(...); await drain()
-                # in a loop would never call connection_lost(), so it
-                # would not see an error when the socket is closed.
-                yield
-        await self._protocol._drain_helper()
+        assert self._transport is not None
+        if self._transport.is_closing():
+            raise ConnectionResetError('Connection lost')
+        if not self._write_paused:
+            return
+        waiter = self._write_waiter
+        if waiter is None or waiter.cancelled():
+            waiter = self._loop.create_future()
+            self._write_waiter = waiter
+            await waiter
+        else:
+            new_waiter = self._loop.create_future()
+            cb = functools.partial(_chain, new_waiter)
+            waiter.add_done_callback(cb)
+            await new_waiter
+
+
+def _chain(new_waiter, real_waiter):
+    if real_waiter.cancelled():
+        new_waiter.cancel()
+    elif real_waiter.exception() is not None:
+        new_waiter.set_exception(real_waiter.exception())
+    else:
+        new_waiter.set_result(real_waiter.result())
 
 
 class _Protocol(asyncio.Protocol):
@@ -525,33 +570,27 @@ class _Protocol(asyncio.Protocol):
     def __init__(self, stream, client_connected_cb=None, *, loop):
         self._loop = loop
         self._stream = stream
-        self._paused = False
-        self._write_waiter = None
-        self._connection_lost = False
         self._client_connected_cb = client_connected_cb
         self._over_ssl = False
 
     def pause_writing(self):
-        assert not self._paused
-        self._paused = True
+        stream = self._stream
+        assert not stream._write_paused
+        stream._write_paused = True
         if self._loop.get_debug():
-            logger.debug("%r pauses writing", self)
+            logger.debug("%r pauses writing", stream)
 
     def resume_writing(self):
-        assert self._paused
-        self._paused = False
+        stream = self._stream
+        assert stream._write_paused
+        stream._write_paused = False
         if self._loop.get_debug():
-            logger.debug("%r resumes writing", self)
-
-        waiter = self._drain_waiter
-        if waiter is not None:
-            self._write_waiter = None
-            if not waiter.done():
-                waiter.set_result(None)
+            logger.debug("%r resumes writing", stream)
+        stream._wakeup_writers()
 
     def connection_made(self, transport):
-        self._stream.set_transport(transport)
-        self._over_ssl = asyncio.get_extra_info('sslcontext') is not None
+        self._stream._setup(transport, self)
+        self._over_ssl = transport.get_extra_info('sslcontext') is not None
         if self._client_connected_cb is not None:
             coro = self._client_connected_cb(self._stream),
             # TODO: await the task somewhere
@@ -559,45 +598,20 @@ class _Protocol(asyncio.Protocol):
 
     def connection_lost(self, exc):
         if exc is None:
-            self._stream_reader.feed_eof()
+            self._stream._feed_eof()
         else:
-            self._stream_reader.set_exception(exc)
-        self._connection_lost = True
-        # Wake up the writer if currently paused.
-        if not self._paused:
-            return
-        waiter = self._write_waiter
-        if waiter is None:
-            return
-        self._write_waiter = None
-        if waiter.done():
-            return
-        if exc is None:
-            waiter.set_result(None)
-        else:
-            waiter.set_exception(exc)
+            self._stream._set_exception(exc)
         self._stream._close_waiter.set_result(None)
         self._stream = None
 
     def data_received(self, data):
-        self._stream.feed_data(data)
+        self._stream._feed_data(data)
 
     def eof_received(self):
-        self._stream.feed_eof()
+        self._stream._feed_eof()
         if self._over_ssl:
             # Prevent a warning in SSLProtocol.eof_received:
             # "returning true from eof_received()
             # has no effect when using ssl"
             return False
         return True
-
-    async def _drain_helper(self):
-        if self._connection_lost:
-            raise ConnectionResetError('Connection lost')
-        if not self._paused:
-            return
-        waiter = self._write_waiter
-        assert waiter is None or waiter.cancelled()
-        waiter = self._loop.create_future()
-        self._write_waiter = waiter
-        await waiter
