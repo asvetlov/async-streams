@@ -178,14 +178,17 @@ class Stream:
     async def write(self, data):
         await self._drain()
         self._transport.write(data)
+        await self._drain()
 
     async def writelines(self, data):
         await self._drain()
         self._transport.writelines(data)
+        await self._drain()
 
     async def write_eof(self):
         await self._drain()
         return self._transport.write_eof()
+        await self._drain()
 
     def can_write_eof(self):
         return self._transport.can_write_eof()
